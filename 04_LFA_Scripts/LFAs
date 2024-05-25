@@ -1,0 +1,562 @@
+Function New-AutorunBaseline($targets,$filename,[PSCredential]$creds,$so){
+    $jobs = @()
+    $FinalOutput = @()
+    $x = 0
+    
+    $MaxConcurrentJobs  = 5 # set the maximum number of concurrent jobs
+    $MaxJobDuration     = 180  # maximum duration in seconds for a job to run
+
+    foreach ($target in $targets) {
+        # throttle the number of concurrent jobs
+        while ($jobs.Count -ge $MaxConcurrentJobs) {
+            # wait for an active job to complete before starting a new one
+            $CompletedJob = Wait-Job -Any -Timeout 1
+            if ($CompletedJob) {
+                $FinalOutput += Receive-Job $CompletedJob
+                Remove-Job $CompletedJob
+            }
+        }
+            
+        $StartTime = Get-Date
+    
+        $jobs += Start-Job { # enable multithreading operations
+            param($target,$filename,[PSCredential]$creds)
+            $localFinalOutput = @()
+
+            # check for runaway jobs
+            while (@((Get-Job -State Running) | Measure-Object).Count -ge 1) {
+                $now = Get-Date
+                Write-Host "Current time: $now"
+
+                foreach ($job in @(Get-Job -State Running)) {
+                    $StartTime = (Get-Job -Id $job.Id).PSBeginTime
+                    Write-Host "Job ID $($job.Id) started at: $StartTime"
+
+                    if ($now - $StartTime -gt [TimeSpan]::FromMinutes(5)) {
+                        Write-Host "Stopping Job ID $($job.Id) because it has been running for more than 5 minutes."
+                        Stop-Job $job
+                    }
+                }
+                Start-Sleep -Seconds 2
+            }
+
+            $LFA = Invoke-Command -CN $using:target -CR $using:creds -SessionOption $using:so {
+                Get-CimInstance -Class Win32_StartupCommand
+            }
+
+            $LFA | Sort-Object -Property pscomputername, Name, Command, Location -Unique |
+                Group-Object Name |
+                    Where-Object {$_.count -le 2} |
+                        Select-Object -ExpandProperty Group
+
+            foreach ( $entry in $autoruns ){
+                $PSObj = [pscustomobject]@{ 
+                    IP        = $target
+                    Name      = $entry.Name
+                    Command   = $entry.Command
+                    User      = $entry.User
+                    UserSID   = $entry.UserSID
+                    Location  = $entry.Location
+                }
+                $localFinalOutput += $PSObj
+            }
+            $localFinalOutput
+        } -ArgumentList $target, $filename, $creds, $so, $StartTime 
+		$x++
+    }
+
+    # wait for the runaway jobs to complete or kill them
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Wait-Job -Timeout $maxJobDuration -ErrorAction SilentlyContinue
+        if ($job -and $job.State -eq 'Running') {
+            # job has been running for too long, remove it
+            Write-Host "Job $($job.Id) on $($targets[$x]) has been running for too long. Removing..."
+            Stop-Job $job
+            Remove-Job $job
+        } elseif ($job) {
+            $FinalOutput += Receive-Job $job
+            $job | Remove-Job
+        }
+        Write-Progress -Activity "BASELINING..." -Status " $($x + 1) of $($targets.Count)" -PercentComplete ($x / $targets.Count * 100)
+    }
+
+    # wait for all jobs to complete
+    $results = Receive-Job -Job $jobs -Wait
+
+    # remove the jobs
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Stop-Job -PassThru -ErrorAction SilentlyContinue
+        $null = $job | Remove-Job -ErrorAction SilentlyContinue
+    }
+
+   # update the original variable with the modified output
+    $FinalOutput += $results
+
+    # export the final output
+    $FinalOutput | Select-Object -ExcludeProperty PSSourceJobInstanceId | Export-Csv $CSVTarget\$filename.csv -Append
+
+    Write-Progress -Activity "BASELINING..." -Status "Finished" -PercentComplete 100
+}
+
+Function New-FilesBaseline($targets,$filename,[PSCredential]$creds,$so){
+    $filePatterns = @(
+        "*.exe",
+        "*.dll"
+    )
+    $folders = @(
+        "C:\temp",
+        "C:\WINDOWS",
+        "\System Volume Information",
+        "C:\`$Recycle.Bin",
+        "C:\Program Files",
+        "C:\Program Files (x86)",
+        "C:\Users\*\AppData"
+    )
+    $jobs = @()
+    $FinalOutput = @()
+    $x = 0
+
+    $MaxConcurrentJobs  = 5 # set the maximum number of concurrent jobs
+    $MaxJobDuration     = 180  # maximum duration in seconds for a job to run
+
+    foreach ($target in $targets) {
+        # throttle the number of concurrent jobs
+        while ($jobs.Count -ge $MaxConcurrentJobs) {
+            # wait for an active job to complete before starting a new one
+            $CompletedJob = Wait-Job -Any -Timeout 1
+            if ($CompletedJob) {
+                $FinalOutput += Receive-Job $CompletedJob
+                Remove-Job $CompletedJob
+            }
+        }
+            
+        $StartTime = Get-Date
+    
+        $jobs += Start-Job { # enable multithreading operations
+            param($target,$filename,[PSCredential]$creds,$so)
+            $localFinalOutput = @()
+            
+            $files = Invoke-Command -CN $using:target -CR $using:creds -SessionOption $using:so {
+                param ($filePatterns, $folders)
+                $files = Get-ChildItem -Path $folders -Recurse -File -include $filePatterns -Force -ErrorAction Continue
+                $files
+            } -ArgumentList $using:filePatterns, $using:folders
+            foreach ( $file in $files ){
+                $PSObj = [pscustomobject]@{ 
+                    IP              = $target
+                    Name            = $file.Name
+                    ResolvedTarget  = $file.Fullname
+                    Mode            = $file.Mode
+                    Attributes      = $file.Attributes
+                    Extension       = $file.Extension
+                    CreationTime    = $file.CreationTime
+                    LastAccessTime  = $file.LastAccessTime
+                    LastWriteTime   = $file.LastWriteTime
+                }
+                $localFinalOutput += $PSObj
+            }
+            $localFinalOutput
+        } -ArgumentList $target, $filename, $creds, $so, $StartTime
+		$x++
+    }
+
+    # wait for the runaway jobs to complete or kill them
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Wait-Job -Timeout $maxJobDuration -ErrorAction SilentlyContinue
+        if ($job -and $job.State -eq 'Running') {
+            # job has been running for too long, remove it
+            Write-Host "Job $($job.Id) on $($targets[$x]) has been running for too long. Removing..."
+            Stop-Job $job
+            Remove-Job $job
+        } elseif ($job) {
+            $FinalOutput += Receive-Job $job
+            $job | Remove-Job
+        }
+        Write-Progress -Activity "BASELINING..." -Status " $($x + 1) of $($targets.Count)" -PercentComplete ($x / $targets.Count * 100)
+    }
+
+    # wait for all jobs to complete
+    $results = Receive-Job -Job $jobs -Wait
+
+    # remove the jobs
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Stop-Job -PassThru -ErrorAction SilentlyContinue
+        $null = $job | Remove-Job -ErrorAction SilentlyContinue
+    }
+
+   # update the original variable with the modified output
+    $FinalOutput += $results
+
+    # export the final output
+    $FinalOutput | Select-Object -ExcludeProperty PSSourceJobInstanceId | Export-Csv $CSVTarget\$filename.csv -Append
+
+    Write-Progress -Activity "BASELINING..." -Status "Finished" -PercentComplete 100
+}
+
+Function New-ProcessesBaseline($targets,$filename,[PSCredential]$creds,$so){
+    $jobs = @()
+    $FinalOutput = @()
+    $x = 0
+
+    $MaxConcurrentJobs  = 5 # set the maximum number of concurrent jobs
+    $MaxJobDuration     = 180  # maximum duration in seconds for a job to run
+
+    foreach ($target in $targets) {
+        # throttle the number of concurrent jobs
+        while ($jobs.Count -ge $MaxConcurrentJobs) {
+            # wait for an active job to complete before starting a new one
+            $CompletedJob = Wait-Job -Any -Timeout 1
+            if ($CompletedJob) {
+                $FinalOutput += Receive-Job $CompletedJob
+                Remove-Job $CompletedJob
+            }
+        }
+        
+        $StartTime = Get-Date
+
+        $jobs += Start-Job { # enable multithreading operations
+            param($target,$filename,[PSCredential]$creds,$so,$StartTime)
+            $localFinalOutput = @()
+            
+            $current = Invoke-Command -CN $target -CR $creds -SessionOption $so {
+                Get-CimInstance Win32_Process
+            }
+            $current | Sort-Object -Property pscomputername, name -Unique |
+                Group-Object name |
+                    Where-Object {$_.count -le 2} |
+                        Select-Object -ExpandProperty Group
+
+            foreach ($process in $processes) {
+                $PSObj = [pscustomobject]@{
+                    IP              = $target
+                    Name            = $process.ProcessName
+                    ID              = $process.Id
+                    CPUUsage        = $process.CPU
+                    MemoryUsage     = $process.WorkingSet
+                    StartTime       = $process.StartTime
+                    CommandLine     = $process.CommandLine
+                    ExecutablePath  = $process.ExecutablePath
+                }
+                $localFinalOutput += $PSObj
+            }
+            $localFinalOutput
+        } -ArgumentList $target, $filename, $creds, $so, $StartTime
+        $x++
+    }
+
+    # wait for the runaway jobs to complete or kill them
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Wait-Job -Timeout $maxJobDuration -ErrorAction SilentlyContinue
+        if ($job -and $job.State -eq 'Running') {
+            # job has been running for too long, remove it
+            Write-Host "Job $($job.Id) on $($targets[$x]) has been running for too long. Removing..."
+            Stop-Job $job
+            Remove-Job $job
+        } elseif ($job) {
+            $FinalOutput += Receive-Job $job
+            $job | Remove-Job
+        }
+        Write-Progress -Activity "BASELINING..." -Status " $($x + 1) of $($targets.Count)" -PercentComplete ($x / $targets.Count * 100)
+    }
+
+    # wait for all jobs to complete
+    $results = Receive-Job -Job $jobs -Wait
+
+    # remove the jobs
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Stop-Job -PassThru -ErrorAction SilentlyContinue
+        $null = $job | Remove-Job -ErrorAction SilentlyContinue
+    }
+
+   # update the original variable with the modified output
+    $FinalOutput += $results
+
+    # export the final output
+    $FinalOutput | Select-Object -ExcludeProperty PSSourceJobInstanceId | Export-Csv $CSVTarget\$filename.csv -Append
+
+    Write-Progress -Activity "BASELINING..." -Status "Finished" -PercentComplete 100
+}
+
+Function New-ScheduledTasksBaseline($targets,$filename,[PSCredential]$creds,$so){
+    $jobs = @()
+    $FinalOutput = @()
+    $x = 0
+
+    $MaxConcurrentJobs  = 5 # set the maximum number of concurrent jobs
+    $MaxJobDuration     = 180  # maximum duration in seconds for a job to run
+
+    foreach ($target in $targets) {
+        # throttle the number of concurrent jobs
+        while ($jobs.Count -ge $MaxConcurrentJobs) {
+            # wait for an active job to complete before starting a new one
+            $CompletedJob = Wait-Job -Any -Timeout 1
+            if ($CompletedJob) {
+                $FinalOutput += Receive-Job $CompletedJob
+                Remove-Job $CompletedJob
+            }
+        }
+           
+        $StartTime = Get-Date
+     
+        $jobs += Start-Job { # enable multithreading operations
+            param($target,$filename,[PSCredential]$creds,$so)
+            $localFinalOutput = @()
+            
+            $current = Invoke-Command -CN $target -CR $creds -SessionOption $so {
+                Get-CimInstance -ClassName MSFT_ScheduledTask -Namespace "Root\Microsoft\Windows\TaskScheduler"
+            }
+
+            $current | Sort-Object -Property pscomputername, taskname -Unique |
+                Group-Object taskname |
+                    Where-Object {$_.count -le 2} |
+                        Select-Object -ExpandProperty Group
+
+            foreach ($task in $scheduledTasks) {
+                $PSObj = [pscustomobject]@{
+                    IP          = $target
+                    TaskName    = $task.TaskName
+                    Path        = $task.Path
+                    Description = $task.Description
+                    Status      = $task.State
+                    NextRunTime = $task.NextRunTime
+                }
+                $localFinalOutput += $PSObj
+            }
+            $localFinalOutput
+        } -ArgumentList $target, $filename, $creds, $so, $StartTime
+		$x++
+    }
+
+    # wait for the runaway jobs to complete or kill them
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Wait-Job -Timeout $maxJobDuration -ErrorAction SilentlyContinue
+        if ($job -and $job.State -eq 'Running') {
+            # job has been running for too long, remove it
+            Write-Host "Job $($job.Id) on $($targets[$x]) has been running for too long. Removing..."
+            Stop-Job $job
+            Remove-Job $job
+        } elseif ($job) {
+            $FinalOutput += Receive-Job $job
+            $job | Remove-Job
+        }
+        Write-Progress -Activity "BASELINING..." -Status " $($x + 1) of $($targets.Count)" -PercentComplete ($x / $targets.Count * 100)
+    }
+
+    # wait for all jobs to complete
+    $results = Receive-Job -Job $jobs -Wait
+
+    # remove the jobs
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Stop-Job -PassThru -ErrorAction SilentlyContinue
+        $null = $job | Remove-Job -ErrorAction SilentlyContinue
+    }
+
+   # update the original variable with the modified output
+    $FinalOutput += $results
+
+    # export the final output
+    $FinalOutput | Select-Object -ExcludeProperty PSSourceJobInstanceId | Export-Csv $CSVTarget\$filename.csv -Append
+
+    Write-Progress -Activity "BASELINING..." -Status "Finished" -PercentComplete 100
+}
+
+Function New-ServicesBaseline($targets,$filename,[PSCredential]$creds,$so){
+    $jobs = @()
+    $FinalOutput = @()
+    $x = 0
+
+    $MaxConcurrentJobs  = 5 # set the maximum number of concurrent jobs
+    $MaxJobDuration     = 180  # maximum duration in seconds for a job to run
+
+    foreach ($target in $targets) {
+        # throttle the number of concurrent jobs
+        while ($jobs.Count -ge $MaxConcurrentJobs) {
+            # wait for an active job to complete before starting a new one
+            $CompletedJob = Wait-Job -Any -Timeout 1
+            if ($CompletedJob) {
+                $FinalOutput += Receive-Job $CompletedJob
+                Remove-Job $CompletedJob
+            }
+        }
+        
+        $StartTime = Get-Date
+        
+        $jobs += Start-Job { # enable multithreading operations
+            param($target,$filename,[PSCredential]$creds,$so)
+            $localFinalOutput = @()
+            
+            $current = Invoke-Command -CN $target -CR $creds -SessionOption $so {
+                Get-CimInstance -Class Win32_Service
+            }
+
+            $current | Sort-Object -Property pscomputername, ServiceName -Unique |
+                Group-Object ServiceName |
+                    Where-Object {$_.count -le 2} |
+                        Select-Object -ExpandProperty Group
+
+            foreach ($service in $services) {
+                $PSObj = [PSCustomObject]@{
+                    IP          = $target
+                    ServiceName = $service.Name
+                    DisplayName = $service.DisplayName
+                    Path        = $service.pathname
+                    State       = $service.state
+                    Status      = $service.Status
+                    StartType   = $service.StartType
+                }
+                $localFinalOutput += $PSObj
+            }
+            $localFinalOutput
+        } -ArgumentList $target, $filename, $creds, $so, $StartTime
+        $x++
+    }
+
+    # wait for the runaway jobs to complete or kill them
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Wait-Job -Timeout $maxJobDuration -ErrorAction SilentlyContinue
+        if ($job -and $job.State -eq 'Running') {
+            # job has been running for too long, remove it
+            Write-Host "Job $($job.Id) on $($targets[$x]) has been running for too long. Removing..."
+            Stop-Job $job
+            Remove-Job $job
+        } elseif ($job) {
+            $FinalOutput += Receive-Job $job
+            $job | Remove-Job
+        }
+        Write-Progress -Activity "BASELINING..." -Status " $($x + 1) of $($targets.Count)" -PercentComplete ($x / $targets.Count * 100)
+    }
+
+    # wait for all jobs to complete
+    $results = Receive-Job -Job $jobs -Wait
+
+    # remove the jobs
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Stop-Job -PassThru -ErrorAction SilentlyContinue
+        $null = $job | Remove-Job -ErrorAction SilentlyContinue
+    }
+
+   # update the original variable with the modified output
+    $FinalOutput += $results
+
+    # export the final output
+    $FinalOutput | Select-Object -ExcludeProperty PSSourceJobInstanceId | Export-Csv $CSVTarget\$filename.csv -Append
+
+    Write-Progress -Activity "BASELINING..." -Status "Finished" -PercentComplete 100
+}
+
+Function New-SoftwareBaseline($targets,$filename,[PSCredential]$creds,$so){
+    $jobs = @()
+    $FinalOutput = @()
+    $x = 0
+
+    $MaxConcurrentJobs  = 5 # set the maximum number of concurrent jobs
+    $MaxJobDuration     = 180  # maximum duration in seconds for a job to run
+
+    foreach ($target in $targets) {
+        # throttle the number of concurrent jobs
+        while ($jobs.Count -ge $MaxConcurrentJobs) {
+            # wait for an active job to complete before starting a new one
+            $CompletedJob = Wait-Job -Any -Timeout 1
+            if ($CompletedJob) {
+                $FinalOutput += Receive-Job $CompletedJob
+                Remove-Job $CompletedJob
+            }
+        }
+        
+        $StartTime = Get-Date
+        
+        $jobs += Start-Job { # enable multithreading operations
+            param($target,$filename,[PSCredential]$creds,$so)
+
+            $localFinalOutput = @()
+            
+            $SoftwareList = Invoke-Command -CN $using:target -CR $using:creds -SessionOption $using:so {
+                $result = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*
+                $result += Get-ItemProperty HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*
+                $result += Get-ItemProperty REGISTRY::HKEY_USERS\*\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*
+                return $result
+            }
+
+            foreach ($software in $SoftwareList) {
+                $LogEntry = Get-WinEvent -LogName "Application" | Where-Object { $_.id -eq 1033 -and $_.message -like "*$software.name*" -or $_.message -like "*$software.pschildname*" }
+                if($LogEntry){
+                    if($LogEntry.UserID){ $InstalledBySID = $LogEntry.UserID.value }
+                    else { $InstalledBySID = "Unknown" }
+                }
+                else { $InstalledBySID = "Unknown" }
+
+                # $InstalledBySID = Get-SoftwareInstallUser $software.Name
+                if ( $InstalledBySID -ne "Unknown" ){
+                    $InstalledByAcct = Invoke-Command -CN $using:target -CR $using:creds -SessionOption $using:so {
+                        (Get-CimInstance -ClassName Win32_Useraccount | Where-Object { $_.SID -eq $InstalledBySID }).name}
+                    $InstalledByProf = Invoke-Command -CN $using:target -CR $using:creds -SessionOption $using:so {
+                        (Get-CimInstance -ClassName Win32_UserProfile | Where-Object { $_.SID -eq $InstalledBySID }).LocalPath}
+                }
+                $PSObj = [PSCustomObject]@{
+                    IP                  = $target
+                    PSParentPath        = $software.PSPath
+                    PSChildName         = $software.PSChildName
+                    DisplayName         = if ( $software.DisplayName ) { $software.DisplayName } else { '-' }
+                    DisplayVersion      = if ( $software.DisplayVersion ) { $software.DisplayVersion } else { '-' }
+                    InstallDate         = if ( $software.InstallDate ) { $software.InstallDate } else { '-' }
+                    InstallLocation     = if ( $software.InstallLocation ) { $software.InstallLocation } else { '-' }
+                    Publisher           = if ( $software.Publisher ) { $software.Publisher } else { '-' }
+                    UninstallString     = if ( $software.UninstallString ) { $software.UninstallString } else { '-' }
+                    InstalledToProfile  = if ( $software.UninstallString -like "*C:\users\*" ) {( $software.UninstallString -split '\\' )[2] } else { '-' }
+                    # in testing env, these three properties were usually blank
+                    # the SID may not be recorded on install as often as it should be
+                    InstalledBySID      = $InstalledBySID
+                    InstalledByAcct     = $InstalledByAcct
+                    InstalledByProf     = $InstalledByProf
+                }
+                $localFinalOutput += $PSObj
+            }
+            $localFinalOutput
+        } -ArgumentList $target, $filename, $creds, $so, $StartTime
+        $x++
+    }
+
+    # wait for the runaway jobs to complete or kill them
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Wait-Job -Timeout $maxJobDuration -ErrorAction SilentlyContinue
+        if ($job -and $job.State -eq 'Running') {
+            # job has been running for too long, remove it
+            Write-Host "Job $($job.Id) on $($targets[$x]) has been running for too long. Removing..."
+            Stop-Job $job
+            Remove-Job $job
+        } elseif ($job) {
+            $FinalOutput += Receive-Job $job
+            $job | Remove-Job
+        }
+        Write-Progress -Activity "BASELINING..." -Status " $($x + 1) of $($targets.Count)" -PercentComplete ($x / $targets.Count * 100)
+    }
+
+    # wait for all jobs to complete
+    $results = Receive-Job -Job $jobs -Wait
+
+    # remove the jobs
+    $jobs | ForEach-Object {
+        $job = $_
+        $null = $job | Stop-Job -PassThru -ErrorAction SilentlyContinue
+        $null = $job | Remove-Job -ErrorAction SilentlyContinue
+    }
+
+   # update the original variable with the modified output
+    $FinalOutput += $results
+
+    # export the final output
+    $FinalOutput | Select-Object -ExcludeProperty PSSourceJobInstanceId | Export-Csv $CSVTarget\$filename.csv -Append
+
+    Write-Progress -Activity "BASELINING..." -Status "Finished" -PercentComplete 100
+}

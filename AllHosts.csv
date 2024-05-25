@@ -1,0 +1,3 @@
+Domain,Subnet,Hostname,IP,OS
+mal.not,##,DC1,192.168.75.130,WinServer2019
+mal.not,##,Win10,192.168.75.128,Win10

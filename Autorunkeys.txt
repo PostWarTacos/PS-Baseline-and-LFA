@@ -1,0 +1,4 @@
+HKLM:\Software\Microsoft\Windows\CurrentVersion\Run
+HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce
+HKCU:\Software\Microsoft\Windows\CurrentVersion\Run
+HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce
